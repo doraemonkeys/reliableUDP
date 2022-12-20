@@ -23,7 +23,7 @@ type addrInfo struct {
 	myAck           uint32      //自己的确认号，收到对方的ack包后，myAck=收到的ack-1，用于判断是否收到对方的ack包，最大为seq，最小为0
 	lastActive      time.Time   //最后一次活跃时间
 	connectionState bool        //连接状态，握手成功后为true，断开连接后为false
-	waitConnection  bool        //我方正处于主动握手的状态
+	waitConnection  bool        //我方正处于握手的状态
 	randNum         uint32      //随机数，用于握手包的校验
 	seqLock         *sync.Mutex //发送序号的锁，保证每次发送的序号不一样
 }
@@ -106,6 +106,7 @@ func (r *ReliableUDP) recv() {
 				delete(r.addrMap, addr.String())
 				delete(r.dataMap, addr.String())
 				r.mapLock.Unlock()
+				continue
 			}
 			if newAddrInfo.randNum == binary.LittleEndian.Uint32(data[8:12]) {
 				//过期的握手包
@@ -128,6 +129,11 @@ func (r *ReliableUDP) recv() {
 				//fmt.Println("我方处于非握手状态")
 				newAddrInfo.waitConnection = true
 				newAddrInfo.seqLock.Unlock()
+				go func() {
+					time.Sleep(time.Second * 30)
+					newAddrInfo.waitConnection = false
+					//fmt.Println("等待握手超时")
+				}()
 			}
 			newAddrInfo.randNum = binary.LittleEndian.Uint32(data[8:12])
 			//握手包，这表示建立一个新的连接
