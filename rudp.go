@@ -33,12 +33,12 @@ type udpMsg struct {
 }
 
 type ReliableUDP struct {
-	conn       *net.UDPConn
-	addrMap    map[string]*addrInfo   //string必须为ip:port
-	mapLock    *sync.RWMutex          //两个Map的锁，保证读写安全
-	dataMap    map[string]chan []byte //string必须为ip:port,用于不同地址的数据包缓冲
-	close      bool                   //关闭标志
-	receiveAll chan udpMsg            //接收所有数据包的通道
+	conn         *net.UDPConn
+	addrMap      map[string]*addrInfo   //string必须为ip:port
+	mapLock      *sync.RWMutex          //两个Map的锁，保证读写安全
+	dataMap      map[string]chan []byte //string必须为ip:port,用于不同地址的数据包缓冲
+	close        bool                   //关闭标志
+	receiveAllCh chan udpMsg            //接收所有数据包的通道
 }
 
 // 应该确保conn是可用的
@@ -74,7 +74,7 @@ func (r *ReliableUDP) recv() {
 			newAddrInfo = &addrInfo{ack: 1}
 			r.mapLock.Lock()
 			r.addrMap[addr.String()] = newAddrInfo
-			r.dataMap[addr.String()] = make(chan []byte, 10) //缓冲区大小为10个数据包
+			r.dataMap[addr.String()] = make(chan []byte, 50) //缓冲区大小,超过50个数据包后会阻塞,所以应该尽快读取
 			newAddrInfo.seqLock = &sync.Mutex{}
 			r.mapLock.Unlock()
 		}
@@ -162,8 +162,8 @@ func (r *ReliableUDP) recv() {
 		}
 		if recvSeq == 1 && ack == 0 {
 			//对方发送的不可靠的数据包(不携带序号)
-			if r.receiveAll != nil {
-				r.receiveAll <- udpMsg{addr: addr, data: data[8:n]}
+			if r.receiveAllCh != nil {
+				r.receiveAllCh <- udpMsg{addr: addr, data: data[8:n]}
 			} else {
 				r.mapLock.RLock()
 				r.dataMap[addr.String()] <- data[8:n]
@@ -185,8 +185,8 @@ func (r *ReliableUDP) recv() {
 		//新包
 		newAddrInfo.ack = recvSeq + 1
 		//fmt.Println("接收到新包", recvSeq, "ack", ack, "myAck", newAddrInfo.myAck, "addr", addr.String())
-		if r.receiveAll != nil {
-			r.receiveAll <- udpMsg{addr: addr, data: data[8:n]}
+		if r.receiveAllCh != nil {
+			r.receiveAllCh <- udpMsg{addr: addr, data: data[8:n]}
 		} else {
 			r.mapLock.RLock()
 			r.dataMap[addr.String()] <- data[8:n]
@@ -305,7 +305,10 @@ func (r *ReliableUDP) Send(data []byte, addr *net.UDPAddr) error {
 			newAddrInfo.seqLock.Unlock()
 		}
 	}
-
+	for newAddrInfo.seq-newAddrInfo.myAck > 5 {
+		//发送太多的数据包没用，会被对方丢弃，等待对方确认
+		time.Sleep(time.Millisecond * 100)
+	}
 	var tempSeq uint32
 	newAddrInfo.seqLock.Lock()
 	newAddrInfo.seq++
@@ -402,22 +405,56 @@ func (r *ReliableUDP) Receive(addr *net.UDPAddr, timeout time.Duration) ([]byte,
 	}
 }
 
+// 取消全局接收
+func (r *ReliableUDP) CancelGlobalReceive() {
+	tempCh := r.receiveAllCh
+	r.receiveAllCh = nil
+	//清空通道，可能会导致乱序
+	for v := range tempCh {
+		r.mapLock.RLock()
+		dataCH, ok := r.dataMap[v.addr.String()]
+		r.mapLock.RUnlock()
+		if ok {
+			dataCH <- v.data
+		}
+	}
+}
+
 func (r *ReliableUDP) ReceiveAll(timeout time.Duration) ([]byte, *net.UDPAddr, error) {
-	ch := make(chan udpMsg, 1)
-	r.receiveAll = ch
-	defer func() {
-		r.receiveAll = nil
-	}()
+	if r.receiveAllCh == nil {
+		return nil, nil, errors.New("please set global receive first")
+	}
 	if timeout == 0 {
-		data := <-ch
+		data := <-r.receiveAllCh
 		return data.data, data.addr, nil
 	}
 	select {
-	case data := <-ch:
+	case data := <-r.receiveAllCh:
 		return data.data, data.addr, nil
 	case <-time.After(timeout):
 		return nil, nil, errors.New("receive all timeout")
 	}
+}
+
+// 设置全局接收，如果设置了全局接收，那么Receive函数将不再接收数据包，而是将数据包发送到全局接收通道
+func (r *ReliableUDP) SetGlobalReceive() {
+	ch := make(chan udpMsg, 100)
+	r.receiveAllCh = ch
+	//清空dataMap，将数据包发送到全局接收通道ch，可能会导致乱序
+	r.mapLock.RLock()
+	for k, v := range r.dataMap {
+		addr, err := net.ResolveUDPAddr("udp", k)
+		if err != nil {
+			continue
+		}
+		tempCh := v
+		go func() {
+			for data := range tempCh {
+				ch <- udpMsg{addr: addr, data: data}
+			}
+		}()
+	}
+	r.mapLock.RUnlock()
 }
 
 // 关闭连接，关闭前请确保没有调用中的Receive函数和Send函数
@@ -440,76 +477,3 @@ func (r *ReliableUDP) sendCloseMsg() {
 		go r.sendAck(0, raddr)
 	}
 }
-
-// client
-// func main() {
-// 	udpconn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 12345})
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	defer udpconn.Close()
-// 	rudp := NewReliableUDP(udpconn)
-// 	defer rudp.Close()
-// 	ch := make(chan string)
-// 	go func() {
-// 		addr := <-ch
-// 		raddr, err := net.ResolveUDPAddr("udp", addr)
-// 		if err != nil {
-// 			log.Println(err)
-// 		}
-// 		i := 0
-// 		for {
-// 			msg := fmt.Sprintf("hello %d", i)
-// 			err := rudp.Send([]byte(msg), raddr)
-// 			if err != nil {
-// 				log.Println(err)
-// 			}
-// 			time.Sleep(1 * time.Second)
-// 			i++
-// 		}
-// 	}()
-// 	i := 0
-// 	for {
-// 		d, addr, err := rudp.ReceiveAll(0)
-// 		if err != nil {
-// 			log.Println(err)
-// 		}
-// 		fmt.Println("receive", string(d), addr.String())
-// 		if i == 0 {
-// 			go func() {
-// 				ch <- addr.String()
-// 			}()
-// 		}
-// 		i++
-// 	}
-// }
-
-// server
-// func main() {
-// 	udpconn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 12346})
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	defer udpconn.Close()
-// 	rudp := NewReliableUDP(udpconn)
-// 	defer rudp.Close()
-// 	go func() {
-// 		for {
-// 			d, addr, err := rudp.ReceiveAll(0)
-// 			if err != nil {
-// 				log.Println(err)
-// 			}
-// 			fmt.Println("receive", string(d), addr.String())
-// 		}
-// 	}()
-// 	i := 0
-// 	for {
-// 		msg := fmt.Sprintf("hello %d", i)
-// 		err := rudp.Send([]byte(msg), &net.UDPAddr{IP: net.IPv4(164, 92, 71, 159), Port: 12345})
-// 		if err != nil {
-// 			log.Println(err)
-// 		}
-// 		time.Sleep(time.Second * 10)
-// 		i++
-// 	}
-// }
