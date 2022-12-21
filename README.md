@@ -16,13 +16,9 @@ func main() {
 	defer udpconn.Close()
 	rudp := reliableUDP.NewReliableUDP(udpconn)
 	defer rudp.Close()
-	ch := make(chan string)
+	ch := make(chan *net.UDPAddr)
 	go func() {
-		addr := <-ch
-		raddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			log.Println(err)
-		}
+		raddr := <-ch
 		i := 0
 		for {
 			msg := fmt.Sprintf("hello %d", i)
@@ -44,7 +40,7 @@ func main() {
 		fmt.Println("receive", string(d), addr.String())
 		if i == 0 {
 			go func() {
-				ch <- addr.String()
+				ch <- addr
 			}()
 		}
 		i++
