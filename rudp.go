@@ -438,6 +438,9 @@ func (r *ReliableUDP) ReceiveAll(timeout time.Duration) ([]byte, *net.UDPAddr, e
 
 // 设置全局接收，如果设置了全局接收，那么Receive函数将不再接收数据包，而是将数据包发送到全局接收通道
 func (r *ReliableUDP) SetGlobalReceive() {
+	if r.receiveAllCh != nil {
+		return
+	}
 	ch := make(chan udpMsg, 100)
 	r.receiveAllCh = ch
 	//清空dataMap，将数据包发送到全局接收通道ch，可能会导致乱序
