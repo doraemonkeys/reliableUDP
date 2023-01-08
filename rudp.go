@@ -145,12 +145,12 @@ func (r *ReliableUDP) recv() {
 			}
 			newAddrInfo.randNum = binary.LittleEndian.Uint32(data[8:12])
 			//握手包，这表示建立一个新的连接
+			newAddrInfo.seqLock.Lock()
 			if newAddrInfo.seq != 0 {
-				newAddrInfo.seqLock.Lock()
 				//fmt.Println("seq重置")
 				newAddrInfo.seq = 0
-				newAddrInfo.seqLock.Unlock()
 			}
+			newAddrInfo.seqLock.Unlock()
 			newAddrInfo.myAck = 0
 			newAddrInfo.ack = 1
 			//fmt.Printf("%#v\n", newAddrInfo)
@@ -276,8 +276,12 @@ func (r *ReliableUDP) clearTimeoutAddrInfo() {
 	}
 }
 
-// 最多发送1024-4字节,并发安全
-func (r *ReliableUDP) Send(data []byte, addr *net.UDPAddr) error {
+// 最多发送1024-4字节,并发安全。
+// 发送超时时间为timeout,如果timeout为0则默认为4秒
+func (r *ReliableUDP) Send(addr *net.UDPAddr, data []byte, timeout time.Duration) error {
+	if timeout == 0 {
+		timeout = time.Second * 4
+	}
 	r.mapLock.RLock()
 	newAddrInfo, ok := r.addrMap[addr.String()]
 	r.mapLock.RUnlock()
@@ -312,6 +316,7 @@ func (r *ReliableUDP) Send(data []byte, addr *net.UDPAddr) error {
 					i++
 				}
 				count++
+				//每隔200ms重发一次握手包，最多重发20次(4s)
 				if count > 20 {
 					return errors.New("handshake timeout")
 				}
@@ -345,7 +350,7 @@ func (r *ReliableUDP) Send(data []byte, addr *net.UDPAddr) error {
 	if err != nil {
 		return err
 	}
-	count := 0
+	startTime := time.Now()
 	for {
 		_, err = r.conn.WriteToUDP(buf.Bytes(), addr)
 		if err != nil {
@@ -363,15 +368,15 @@ func (r *ReliableUDP) Send(data []byte, addr *net.UDPAddr) error {
 			time.Sleep(10 * time.Millisecond)
 			i++
 		}
-		count++
-		if count > 20 {
-			if newAddrInfo.seq != 0 {
-				newAddrInfo.seqLock.Lock()
+		if time.Since(startTime) > timeout {
+			newAddrInfo.seqLock.Lock()
+			if newAddrInfo.seq != 0 { //可能已经关闭又重新打开了连接
 				newAddrInfo.seq--
-				newAddrInfo.seqLock.Unlock()
 			}
+			newAddrInfo.seqLock.Unlock()
 			return errors.New("send timeout")
 		}
+		//fmt.Println("重传", addr.String())
 	}
 }
 
