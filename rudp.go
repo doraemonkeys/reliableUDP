@@ -55,7 +55,7 @@ func NewReliableUDP(conn *net.UDPConn) *ReliableUDP {
 	}
 	go rUDP.recv()
 	//清除超时的addrInfo,超时时间为50s
-	go rUDP.clearTimeoutAddrInfo()
+	go rUDP.clearTimeoutAddrInfo(time.Second * 50)
 	rand.Seed(time.Now().UnixNano())
 	return rUDP
 }
@@ -138,6 +138,7 @@ func (r *ReliableUDP) recv() {
 				newAddrInfo.waitConnection = true
 				newAddrInfo.seqLock.Unlock()
 				go func() {
+					//等待30s，将waitConnection置为false
 					time.Sleep(time.Second * 30)
 					newAddrInfo.waitConnection = false
 					//fmt.Println("等待握手超时")
@@ -251,18 +252,18 @@ func (r *ReliableUDP) sendHandshake(randNum uint32, addr *net.UDPAddr) {
 }
 
 // 清除超时的addrInfo
-func (r *ReliableUDP) clearTimeoutAddrInfo() {
+func (r *ReliableUDP) clearTimeoutAddrInfo(timeout time.Duration) {
 	var tempMap1 = r.addrMap
 	var tempMap2 = r.dataMap
 	for {
+		time.Sleep(time.Second * 5) //每5秒清理一次
 		if r.close {
 			return
 		}
-		time.Sleep(time.Second * 5)
 		var delList []string
 		r.mapLock.RLock()
 		for k, v := range tempMap1 {
-			if time.Since(v.lastActive) > time.Second*50 {
+			if time.Since(v.lastActive) > timeout {
 				delList = append(delList, k)
 			}
 		}
@@ -302,7 +303,8 @@ func (r *ReliableUDP) Send(addr *net.UDPAddr, data []byte, timeout time.Duration
 			newAddrInfo.seqLock.Unlock()
 			randNum := rand.Uint32()
 			newAddrInfo.randNum = randNum
-			count := 0
+
+			startTime := time.Now()
 		loop:
 			for {
 				r.sendHandshake(randNum, addr)
@@ -315,9 +317,8 @@ func (r *ReliableUDP) Send(addr *net.UDPAddr, data []byte, timeout time.Duration
 					time.Sleep(time.Millisecond * 10)
 					i++
 				}
-				count++
 				//每隔200ms重发一次握手包，最多重发20次(4s)
-				if count > 20 {
+				if time.Since(startTime) > timeout {
 					return errors.New("handshake timeout")
 				}
 				//fmt.Println("握手超时，重发")
