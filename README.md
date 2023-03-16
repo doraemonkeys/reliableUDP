@@ -13,7 +13,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer udpconn.Close()
 	rudp := reliableUDP.NewReliableUDP(udpconn)
 	defer rudp.Close()
 	ch := make(chan *net.UDPAddr)
@@ -54,7 +53,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer udpconn.Close()
 	rudp := reliableUDP.NewReliableUDP(udpconn)
 	defer rudp.Close()
 	go func() {
