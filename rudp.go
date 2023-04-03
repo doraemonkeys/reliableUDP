@@ -139,8 +139,11 @@ func (r *ReliableUDP) recv() {
 				newAddrInfo.seqLock.Unlock()
 				go func() {
 					//等待30s，将waitConnection置为false
-					time.Sleep(time.Second * 30)
-					newAddrInfo.waitConnection = false
+					waitTime := 30 * time.Second
+					time.Sleep(waitTime)
+					if time.Since(newAddrInfo.lastActive) >= waitTime {
+						newAddrInfo.waitConnection = false
+					}
 					//fmt.Println("等待握手超时")
 				}()
 			}
@@ -160,8 +163,10 @@ func (r *ReliableUDP) recv() {
 		}
 		if recvSeq == 0 && ack == 1 {
 			//握手确认包，这表示连接建立成功
-			newAddrInfo.connectionState = true
-			newAddrInfo.waitConnection = false
+			if newAddrInfo.waitConnection {
+				newAddrInfo.connectionState = true
+				newAddrInfo.waitConnection = false
+			}
 			continue
 		}
 		if recvSeq == 1 && ack == 1 {
