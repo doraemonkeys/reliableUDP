@@ -56,7 +56,7 @@ func NewReliableUDP(conn *net.UDPConn) *ReliableUDP {
 	go rUDP.recv()
 	//清除超时的addrInfo,超时时间为50s
 	go rUDP.clearTimeoutAddrInfo(time.Second * 50)
-	rand.Seed(time.Now().UnixNano())
+	//rand.Seed(time.Now().UnixNano())
 	return rUDP
 }
 
