@@ -10,10 +10,12 @@ import (
 	"time"
 )
 
+const BUF_SIZE = 1024
+
 //注意事项
 // 1.没有考虑序号溢出的情况
 // 2.发送单个数据包最大为1024-8字节
-// 3.50s后断开连接
+// 3.50s后无操作断开连接
 
 type addrInfo struct {
 	seq uint32 //发送序号，第几次发送，第一个序号为1
@@ -40,7 +42,7 @@ type ReliableUDP struct {
 	mapLock      *sync.RWMutex          //两个Map的锁，保证读写安全
 	dataMap      map[string]chan []byte //string必须为ip:port,用于不同地址的数据包缓冲
 	close        bool                   //关闭标志
-	chanLock     *sync.RWMutex          //通道锁，保证receiveAllCh通道的安全
+	chanLock     *sync.RWMutex          //通道锁，保证receiveAllCh通道的安全(例如receiveAllCh使用时不被修改为nil)
 	receiveAllCh chan udpMsg            //接收所有数据包的通道
 }
 
@@ -64,14 +66,31 @@ func (r *ReliableUDP) LocalAddr() net.Addr {
 	return r.conn.LocalAddr()
 }
 
+// save 保存非全局数据包
+func (r *ReliableUDP) save(data []byte, addrKey string) {
+	r.mapLock.RLock()
+	r.dataMap[addrKey] <- data
+	r.mapLock.RUnlock()
+}
+
+func (r *ReliableUDP) saveData(data []byte, addr *net.UDPAddr) {
+	r.chanLock.RLock()
+	if r.receiveAllCh != nil {
+		r.receiveAllCh <- udpMsg{addr: addr, data: data}
+	} else {
+		r.save(data, addr.String())
+	}
+	r.chanLock.RUnlock()
+}
+
 // 接收数据,返回ack
 func (r *ReliableUDP) recv() {
-	var data [1024]byte
+	var buffer [BUF_SIZE]byte
 	for {
 		if r.close {
 			return
 		}
-		n, addr, err := r.conn.ReadFromUDP(data[:]) //Close后会停止阻塞
+		n, addr, err := r.conn.ReadFromUDP(buffer[:]) //Close后会停止阻塞
 		if err != nil {
 			continue
 		}
@@ -86,137 +105,129 @@ func (r *ReliableUDP) recv() {
 			newAddrInfo.seqLock = &sync.Mutex{}
 			r.mapLock.Unlock()
 		}
-		if n < 8 { //数据包最小为8字节
+		if n < 8 { //数据包最小为8字节(header)
 			continue
 		}
 		newAddrInfo.lastActive = time.Now()
-		recvSeq := binary.LittleEndian.Uint32(data[:4])
-		ack := binary.LittleEndian.Uint32(data[4:8])
-		// seq ack
-		// 0   >1 普通ack
-		// 0   0  握手包，若不带随机数则为关闭连接包
-		// 0   1  握手确认包
-		// 1   0 不可靠的数据包
-		// 1   1 是合法的数据包，表示我方还没发送数据，对方发送了第一个数据包
-		if recvSeq == 0 && ack > 1 {
-			//ack包
-			if newAddrInfo.myAck < ack-1 {
-				newAddrInfo.myAck = ack - 1
-			}
-			continue
+		recvSeq := binary.LittleEndian.Uint32(buffer[:4])
+		ack := binary.LittleEndian.Uint32(buffer[4:8])
+
+		r.parseRawData(buffer[:n], newAddrInfo, addr, recvSeq, ack)
+	}
+}
+
+func (r *ReliableUDP) parseRawData(rawData []byte, newAddrInfo *addrInfo, addr *net.UDPAddr, recvSeq uint32, ack uint32) {
+	// seq ack
+	// 0   >1 普通ack
+	// 0   0  握手包，若不带随机数则为关闭连接包
+	// 0   1  握手确认包
+	// 1   0 不可靠的数据包
+	// 1   1 是合法的数据包，表示我方还没发送数据，对方发送了第一个数据包
+
+	const pkgHeadLen = 8
+	if recvSeq == 0 && ack > 1 {
+		//ack包
+		if newAddrInfo.myAck < ack-1 {
+			newAddrInfo.myAck = ack - 1
 		}
-		if recvSeq == 0 && ack == 0 {
-			//fmt.Println("握手包")
-			if n < 12 {
-				//关闭连接包
-				//fmt.Println("关闭连接包")
-				r.mapLock.Lock()
-				delete(r.addrMap, addr.String())
-				delete(r.dataMap, addr.String())
-				r.mapLock.Unlock()
-				continue
-			}
-			if newAddrInfo.randNum == binary.LittleEndian.Uint32(data[8:12]) {
-				//过期的握手包
-				//fmt.Println("过期的握手包")
-				//fmt.Println(newAddrInfo.randNum, binary.LittleEndian.Uint32(data[8:12]))
-				r.sendAck(1, addr) //重传握手确认包
-				continue
-			}
-			newAddrInfo.seqLock.Lock()
-			//我方处于握手状态，代表我已经准备好，此时又收到对方的握手包，说明对方也准备好了
-			//此时我方随机数已经生成赋值给randNum，所以替换为对方的随机数(随机数用于防止对方过期的握手包)
-			if newAddrInfo.waitConnection {
-				//fmt.Println("我方处于握手状态，代表我已经准备好，此时又收到对方的握手包，说明对方也准备好了")
-				newAddrInfo.randNum = binary.LittleEndian.Uint32(data[8:12])
-				newAddrInfo.seqLock.Unlock()
-				newAddrInfo.connectionState = true
-				newAddrInfo.waitConnection = false
-				continue
-			} else {
-				//fmt.Println("我方处于非握手状态")
-				newAddrInfo.waitConnection = true
-				newAddrInfo.seqLock.Unlock()
-				go func() {
-					//等待30s，将waitConnection置为false
-					waitTime := 30 * time.Second
-					time.Sleep(waitTime)
-					if time.Since(newAddrInfo.lastActive) >= waitTime {
-						newAddrInfo.waitConnection = false
-					}
-					//fmt.Println("等待握手超时")
-				}()
-			}
-			newAddrInfo.randNum = binary.LittleEndian.Uint32(data[8:12])
-			//握手包，这表示建立一个新的连接
-			newAddrInfo.seqLock.Lock()
-			if newAddrInfo.seq != 0 {
-				//fmt.Println("seq重置")
-				newAddrInfo.seq = 0
-			}
-			newAddrInfo.seqLock.Unlock()
-			newAddrInfo.myAck = 0
-			newAddrInfo.ack = 1
-			//fmt.Printf("%#v\n", newAddrInfo)
-			r.sendAck(1, addr) //发送握手确认包
-			continue
+		return
+	}
+	if recvSeq == 0 && ack == 0 {
+		//fmt.Println("握手包")
+		if len(rawData) < 12 {
+			//关闭连接包
+			//fmt.Println("关闭连接包")
+			r.mapLock.Lock()
+			delete(r.addrMap, addr.String())
+			delete(r.dataMap, addr.String())
+			r.mapLock.Unlock()
+			return
 		}
-		if recvSeq == 0 && ack == 1 {
-			//握手确认包，这表示连接建立成功
-			if newAddrInfo.waitConnection {
-				newAddrInfo.connectionState = true
-				newAddrInfo.waitConnection = false
-			}
-			continue
-		}
-		if recvSeq == 1 && ack == 1 {
-			//对方发送的第一个数据包,说明对方收到了我方的握手确认包，握手成功
-			//fmt.Println("对方发送的第一个数据包,说明对方收到了我方的握手确认包")
+		r.handleHandshake(rawData, newAddrInfo, addr)
+		return
+	}
+	if recvSeq == 0 && ack == 1 {
+		//握手确认包，这表示连接建立成功
+		if newAddrInfo.waitConnection {
+			newAddrInfo.connectionState = true
 			newAddrInfo.waitConnection = false
 		}
-		if recvSeq == 1 && ack == 0 {
-			//对方发送的不可靠的数据包(不携带序号)
-			if r.receiveAllCh != nil {
-				r.chanLock.RLock()
-				if r.receiveAllCh != nil {
-					r.receiveAllCh <- udpMsg{addr: addr, data: data[8:n]}
-				}
-				r.chanLock.RUnlock()
-			} else {
-				r.mapLock.RLock()
-				r.dataMap[addr.String()] <- data[8:n]
-				r.mapLock.RUnlock()
-			}
-			continue
-		}
-		if recvSeq < newAddrInfo.ack {
-			//旧包,发送ack
-			//fmt.Println("旧包", recvSeq, "ack", ack, "myAck", newAddrInfo.myAck, "addr", addr.String())
-			r.sendAck(newAddrInfo.ack, addr)
-			continue
-		}
-		if recvSeq != newAddrInfo.ack {
-			//收到超前乱序的新包直接丢弃(不然处理太麻烦了)
-			//fmt.Println("收到超前乱序的新包直接丢弃", recvSeq, "ack", ack, "myAck", newAddrInfo.myAck, "addr", addr.String())
-			continue
-		}
-		//新包
-		newAddrInfo.ack = recvSeq + 1
-		//fmt.Println("接收到新包", recvSeq, "ack", ack, "myAck", newAddrInfo.myAck, "addr", addr.String())
-		if r.receiveAllCh != nil {
-			r.chanLock.RLock()
-			if r.receiveAllCh != nil {
-				r.receiveAllCh <- udpMsg{addr: addr, data: data[8:n]}
-			}
-			r.chanLock.RUnlock()
-		} else {
-			r.mapLock.RLock()
-			r.dataMap[addr.String()] <- data[8:n]
-			r.mapLock.RUnlock()
-		}
-		//发送ack
-		r.sendAck(newAddrInfo.ack, addr)
+		return
 	}
+	if recvSeq == 1 && ack == 1 {
+		//对方发送的第一个数据包,说明对方收到了我方的握手确认包，握手成功
+		//fmt.Println("对方发送的第一个数据包,说明对方收到了我方的握手确认包")
+		newAddrInfo.waitConnection = false
+	}
+	if recvSeq == 1 && ack == 0 {
+		//对方发送的不可靠的数据包(不携带序号)
+		r.saveData(rawData[pkgHeadLen:], addr)
+		return
+	}
+	if recvSeq < newAddrInfo.ack {
+		//旧包,发送ack
+		//fmt.Println("旧包", recvSeq, "ack", ack, "myAck", newAddrInfo.myAck, "addr", addr.String())
+		r.sendAck(newAddrInfo.ack, addr)
+		return
+	}
+	if recvSeq != newAddrInfo.ack {
+		//收到超前乱序的新包直接丢弃(不然处理太麻烦了)
+		//fmt.Println("收到超前乱序的新包直接丢弃", recvSeq, "ack", ack, "myAck", newAddrInfo.myAck, "addr", addr.String())
+		return
+	}
+	//新包
+	newAddrInfo.ack = recvSeq + 1
+	//fmt.Println("接收到新包", recvSeq, "ack", ack, "myAck", newAddrInfo.myAck, "addr", addr.String())
+	r.saveData(rawData[pkgHeadLen:], addr)
+	//发送ack
+	r.sendAck(newAddrInfo.ack, addr)
+}
+
+func (r *ReliableUDP) handleHandshake(rawData []byte, newAddrInfo *addrInfo, addr *net.UDPAddr) {
+	pkgHeadLen := 12
+	if newAddrInfo.randNum == binary.LittleEndian.Uint32(rawData[pkgHeadLen-4:pkgHeadLen]) {
+		//过期的握手包
+		//fmt.Println("过期的握手包")
+		//fmt.Println(newAddrInfo.randNum, binary.LittleEndian.Uint32(data[8:12]))
+		r.sendAck(1, addr) //重传握手确认包
+		return
+	}
+	newAddrInfo.seqLock.Lock()
+	//我方处于握手状态，代表我已经准备好，此时又收到对方的握手包，说明对方也准备好了
+	//此时我方随机数已经生成赋值给randNum，所以替换为对方的随机数(随机数用于防止对方过期的握手包)
+	if newAddrInfo.waitConnection {
+		//fmt.Println("我方处于握手状态，代表我已经准备好，此时又收到对方的握手包，说明对方也准备好了")
+		newAddrInfo.randNum = binary.LittleEndian.Uint32(rawData[pkgHeadLen-4 : pkgHeadLen])
+		newAddrInfo.seqLock.Unlock()
+		newAddrInfo.connectionState = true
+		newAddrInfo.waitConnection = false
+		return
+	} else {
+		//fmt.Println("我方处于非握手状态")
+		newAddrInfo.waitConnection = true
+		newAddrInfo.seqLock.Unlock()
+		go func() {
+			//等待30s，将waitConnection置为false
+			waitTime := 30 * time.Second
+			time.Sleep(waitTime)
+			if time.Since(newAddrInfo.lastActive) >= waitTime {
+				newAddrInfo.waitConnection = false
+			}
+			//fmt.Println("等待握手超时")
+		}()
+	}
+	newAddrInfo.randNum = binary.LittleEndian.Uint32(rawData[pkgHeadLen-4 : pkgHeadLen])
+	//握手包，这表示建立一个新的连接
+	newAddrInfo.seqLock.Lock()
+	if newAddrInfo.seq != 0 {
+		//fmt.Println("seq重置")
+		newAddrInfo.seq = 0
+	}
+	newAddrInfo.seqLock.Unlock()
+	newAddrInfo.myAck = 0
+	newAddrInfo.ack = 1
+	//fmt.Printf("%#v\n", newAddrInfo)
+	r.sendAck(1, addr) //发送握手确认包
 }
 
 func (r *ReliableUDP) sendAck(ack uint32, addr *net.UDPAddr) {
@@ -282,7 +293,7 @@ func (r *ReliableUDP) clearTimeoutAddrInfo(timeout time.Duration) {
 	}
 }
 
-// 最多发送1024-4字节,并发安全。
+// 最多发送1024-8字节,并发安全。
 // 发送超时时间为timeout,如果timeout为0则默认为4秒
 func (r *ReliableUDP) Send(addr *net.UDPAddr, data []byte, timeout time.Duration) error {
 	if timeout == 0 {
@@ -300,36 +311,10 @@ func (r *ReliableUDP) Send(addr *net.UDPAddr, data []byte, timeout time.Duration
 		r.mapLock.Unlock()
 	}
 	if newAddrInfo.seq == 0 && newAddrInfo.ack == 1 {
-		newAddrInfo.seqLock.Lock()
-		if !newAddrInfo.waitConnection {
-			//表示第一次向对方发送数据，需要先握手
-			//fmt.Println("第一次向对方发送数据，需要先握手", addr.String())
-			newAddrInfo.waitConnection = true //设置为握手状态
-			newAddrInfo.seqLock.Unlock()
-			randNum := rand.Uint32()
-			newAddrInfo.randNum = randNum
-
-			startTime := time.Now()
-		loop:
-			for {
-				r.sendHandshake(randNum, addr)
-				i := 0
-				for i < 20 {
-					if newAddrInfo.connectionState {
-						//fmt.Println("握手成功", addr.String())
-						break loop //握手成功,开始发送数据
-					}
-					time.Sleep(time.Millisecond * 10)
-					i++
-				}
-				//每隔200ms重发一次握手包，最多重发20次(4s)
-				if time.Since(startTime) > timeout {
-					return errors.New("handshake timeout")
-				}
-				//fmt.Println("握手超时，重发")
-			}
-		} else {
-			newAddrInfo.seqLock.Unlock()
+		// 第一次向对方发送数据，需要先握手
+		err := r.handshake(newAddrInfo, addr, timeout)
+		if err != nil {
+			return err
 		}
 	}
 	for newAddrInfo.seq-newAddrInfo.myAck > 5 {
@@ -386,6 +371,41 @@ func (r *ReliableUDP) Send(addr *net.UDPAddr, data []byte, timeout time.Duration
 	}
 }
 
+func (r *ReliableUDP) handshake(newAddrInfo *addrInfo, addr *net.UDPAddr, timeout time.Duration) error {
+	newAddrInfo.seqLock.Lock()
+	if !newAddrInfo.waitConnection {
+		//表示第一次向对方发送数据，需要先握手
+		//fmt.Println("第一次向对方发送数据，需要先握手", addr.String())
+		newAddrInfo.waitConnection = true //设置为握手状态
+		newAddrInfo.seqLock.Unlock()
+		randNum := rand.Uint32()
+		newAddrInfo.randNum = randNum
+
+		startTime := time.Now()
+	loop:
+		for {
+			r.sendHandshake(randNum, addr)
+			i := 0
+			for i < 20 {
+				if newAddrInfo.connectionState {
+					//fmt.Println("握手成功", addr.String())
+					break loop //握手成功,开始发送数据
+				}
+				time.Sleep(time.Millisecond * 10)
+				i++
+			}
+			//每隔200ms重发一次握手包，最多重发20次(4s)
+			if time.Since(startTime) > timeout {
+				return errors.New("handshake timeout")
+			}
+			//fmt.Println("握手超时，重发")
+		}
+	} else {
+		newAddrInfo.seqLock.Unlock()
+	}
+	return nil
+}
+
 // 不可靠的udp发送,并发安全
 func (r *ReliableUDP) SendUnreliable(data []byte, addr *net.UDPAddr) error {
 	var buf = new(bytes.Buffer)
@@ -409,7 +429,7 @@ func (r *ReliableUDP) SendUnreliable(data []byte, addr *net.UDPAddr) error {
 	return nil
 }
 
-// 最多接收1024-4字节
+// 最多接收1024-8字节
 func (r *ReliableUDP) Receive(addr *net.UDPAddr, timeout time.Duration) ([]byte, error) {
 	r.mapLock.RLock()
 	dataCH, ok := r.dataMap[addr.String()]
