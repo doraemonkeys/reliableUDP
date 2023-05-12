@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const BUF_SIZE = 1024
+const p_BUF_SIZE = 1024
 
 //注意事项
 // 1.没有考虑序号溢出的情况
@@ -47,7 +47,7 @@ type ReliableUDP struct {
 }
 
 // 应该确保conn是可用的,且之后不能再使用conn
-func NewReliableUDP(conn *net.UDPConn) *ReliableUDP {
+func New(conn *net.UDPConn) *ReliableUDP {
 	var rUDP = &ReliableUDP{
 		conn:     conn,
 		addrMap:  make(map[string]*addrInfo),
@@ -85,7 +85,7 @@ func (r *ReliableUDP) saveData(data []byte, addr *net.UDPAddr) {
 
 // 接收数据,返回ack
 func (r *ReliableUDP) recv() {
-	var buffer [BUF_SIZE]byte
+	var buffer [p_BUF_SIZE]byte
 	for {
 		if r.close {
 			return
